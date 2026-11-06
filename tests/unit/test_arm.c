@@ -1032,12 +1032,87 @@ static void test_arm_svc_hvc_syndrome(void)
     OK(uc_close(uc));
 }
 
+typedef struct {
+    uint64_t hooked_pc;
+    int fired;
+} test_arm_thumb_it_mem_hook_state;
+
+static void test_arm_thumb_it_mem_hook_cb(uc_engine *uc, uc_mem_type type,
+                                          uint64_t address, int size,
+                                          int64_t value, void *user_data)
+{
+    test_arm_thumb_it_mem_hook_state *state = user_data;
+    uint32_t pc;
+
+    OK(uc_reg_read(uc, UC_ARM_REG_PC, &pc));
+    state->hooked_pc = pc;
+    state->fired += 1;
+}
+
+// A memory hook fired by a conditional load/store inside an IT block must
+// not leak the IT state of that instruction into the following TB: the
+// instruction right after the IT block has to execute unconditionally.
+static void test_arm_thumb_it_block_mem_hook(void)
+{
+    // 0x1000 cmp r0, #0
+    // 0x1002 itet eq
+    // 0x1004 ldreq r3, [r4, #8]
+    // 0x1006 strne r5, [r6, #8]
+    // 0x1008 streq r3, [r6, #4]
+    // 0x100a b 0x1010
+    // 0x100c nop; nop
+    // 0x1010 mov r5, r4
+    // 0x1012 adds r5, #16
+    char code[] = "\x00\x28\x0a\xbf\xa3\x68\xb5\x60\x73\x60\x01\xe0"
+                  "\x00\xbf\x00\xbf\x25\x46\x10\x35";
+    const uint32_t data = 0x8000;
+    const struct {
+        int type;
+        uint32_t r0;
+        uint32_t expect_hooked_pc;
+    } cases[] = {
+        {UC_HOOK_MEM_READ, 0, 0x1004},  // ldreq executes and is hooked
+        {UC_HOOK_MEM_WRITE, 1, 0x1006}, // strne executes and is hooked
+        {UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, 1, 0x1006},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uc_engine *uc;
+        uc_hook hook;
+        test_arm_thumb_it_mem_hook_state state = {0, 0};
+        uint32_t r0 = cases[i].r0, r4 = data, r6 = data + 0x100, r5 = 0;
+
+        uc_common_setup(&uc, UC_ARCH_ARM, UC_MODE_THUMB, code, sizeof(code) - 1,
+                        UC_CPU_ARM_CORTEX_A15);
+        OK(uc_mem_map(uc, data, 0x1000, UC_PROT_ALL));
+        OK(uc_reg_write(uc, UC_ARM_REG_R0, &r0));
+        OK(uc_reg_write(uc, UC_ARM_REG_R4, &r4));
+        OK(uc_reg_write(uc, UC_ARM_REG_R6, &r6));
+        OK(uc_hook_add(uc, &hook, cases[i].type, test_arm_thumb_it_mem_hook_cb,
+                       &state, data, data + 0xfff));
+
+        OK(uc_emu_start(uc, code_start | 1, code_start + sizeof(code) - 1, 0,
+                        0));
+
+        OK(uc_reg_read(uc, UC_ARM_REG_R5, &r5));
+        TEST_CHECK(r5 == data + 16);
+        TEST_MSG("case %zu: r5 = 0x%x, expected 0x%x", i, r5, data + 16);
+        TEST_CHECK(state.fired >= 1);
+        TEST_CHECK(state.hooked_pc == cases[i].expect_hooked_pc);
+        TEST_MSG("case %zu: hook saw pc 0x%" PRIx64 ", expected 0x%x", i,
+                 state.hooked_pc, cases[i].expect_hooked_pc);
+
+        OK(uc_close(uc));
+    }
+}
+
 TEST_LIST = {{"test_arm_nop", test_arm_nop},
              {"test_arm_thumb_sub", test_arm_thumb_sub},
              {"test_armeb_sub", test_armeb_sub},
              {"test_armeb_be8_sub", test_armeb_be8_sub},
              {"test_arm_thumbeb_sub", test_arm_thumbeb_sub},
              {"test_arm_thumb_ite", test_arm_thumb_ite},
+             {"test_arm_thumb_it_block_mem_hook", test_arm_thumb_it_block_mem_hook},
              {"test_arm_m_thumb_mrs", test_arm_m_thumb_mrs},
              {"test_arm_m_control", test_arm_m_control},
              {"test_arm_m_exc_return", test_arm_m_exc_return},
